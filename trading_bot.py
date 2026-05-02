@@ -4,10 +4,12 @@ import numpy as np
 import requests
 from datetime import datetime
 import warnings
+import os
+
 warnings.filterwarnings('ignore')
 
-TELEGRAM_TOKEN = "8690412517:AAHSTJKxcVXMRLNFhTre-E41e2fptHW6DDU"
-TELEGRAM_CHAT_ID = "1253843248"
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8690412517:AAHSTJKxcVXMRLNFhTre-E41e2fptHW6DDU")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "1253843248")
 
 STOCKS = {
     "RELIANCE":   "RELIANCE.NS",
