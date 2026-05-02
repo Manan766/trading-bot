@@ -18,7 +18,7 @@ jobs:
           python-version: '3.10'
 
       - name: Install libraries
-        run: pip install yfinance pandas numpy requests
+        run: pip install yfinance pandas numpy requests feedparser
 
       - name: Run trading bot
         env:
