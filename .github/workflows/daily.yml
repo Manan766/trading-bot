@@ -32,7 +32,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install libraries
-        run: pip install yfinance pandas numpy requests feedparser
+        run: pip install yfinance pandas numpy requests feedparser schedule
 
       - name: Run trading bot
         run: python trading_bot.py
