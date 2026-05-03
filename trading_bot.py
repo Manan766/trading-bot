@@ -4,16 +4,17 @@ import numpy as np
 import requests
 import feedparser
 import os
-import json
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8690412517:AAHSTJKxcVXMRLNFhTre-E41e2fptHW6DDU")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "1253843248")
-TRADES_FILE = "/tmp/active_trades.json"
 BUDGET = 2000
 MAX_PRICE = 1500
+
+# IST = UTC + 5:30
+IST = timezone(timedelta(hours=5, minutes=30))
 
 STOCKS = {
     "SBIN":       ("SBIN.NS",       "Banking"),
@@ -47,8 +48,17 @@ STOCKS = {
     "PFC":        ("PFC.NS",        "Finance"),
 }
 
+def get_ist_time():
+    return datetime.now(IST)
+
+def is_weekday():
+    return get_ist_time().weekday() <= 4
+
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    # Telegram has a 4096 char limit per message
+    if len(message) > 4000:
+        message = message[:3950] + "\n\n... (truncated)"
     data = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
     try:
         r = requests.post(url, data=data, timeout=10)
@@ -75,11 +85,11 @@ def check_news(stock_name):
                 if w in title: pos += 1
             for w in negative:
                 if w in title: neg += 1
-        if pos > neg + 1: return "POSITIVE", titles[:2]
-        elif neg > pos + 1: return "NEGATIVE", titles[:2]
-        return "NEUTRAL", titles[:2]
+        if pos > neg + 1: return "POSITIVE", titles[:2], pos, neg
+        elif neg > pos + 1: return "NEGATIVE", titles[:2], pos, neg
+        return "NEUTRAL", titles[:2], pos, neg
     except:
-        return "NEUTRAL", []
+        return "NEUTRAL", [], 0, 0
 
 def calculate_rsi(prices, period=14):
     delta = prices.diff()
@@ -111,8 +121,12 @@ def get_market_sentiment():
     except:
         return "NEUTRAL", "Market data unavailable"
 
+# ============================================
+# MORNING SIGNALS (9:15 AM)
+# ============================================
 def morning_signals():
-    now = datetime.now().strftime("%d %b %Y, %I:%M %p")
+    now_ist = get_ist_time()
+    now = now_ist.strftime("%d %b %Y, %I:%M %p IST")
     market, market_msg = get_market_sentiment()
     buy_list = []
 
@@ -143,7 +157,7 @@ def morning_signals():
             if price > float(latest['SMA20']) > float(latest['SMA50']): score += 1; reasons.append("Uptrend")
             elif price < float(latest['SMA20']) < float(latest['SMA50']): score -= 1
 
-            news_sent, news_titles = check_news(name)
+            news_sent, news_titles, _, _ = check_news(name)
             vol_avg = float(df['Volume'].rolling(20).mean().iloc[-1])
             vol_today = float(df['Volume'].iloc[-1])
             vol_high = vol_today > vol_avg * 1.2
@@ -167,14 +181,13 @@ def morning_signals():
                     "shares": shares, "score": score, "rr": rr,
                     "reasons": reasons, "news": news_sent,
                     "news_title": news_titles[0][:60] if news_titles else "",
-                    "buy_price": price
                 })
         except Exception as e:
             print(f"Error {name}: {e}")
 
     buy_list.sort(key=lambda x: x['score'], reverse=True)
 
-    msg = f"<b>🤖 AI Trading Signals</b>\n📅 {now}\n💰 Budget: Rs.{BUDGET}\n\n"
+    msg = f"<b>🤖 AI Trading Signals — Subah</b>\n📅 {now}\n💰 Budget: Rs.{BUDGET}\n\n"
     msg += f"<b>Market:</b> {market_msg}\n\n"
 
     if buy_list:
@@ -190,7 +203,8 @@ def morning_signals():
                 f"   📊 R:R={r['rr']}x | {', '.join(r['reasons'][:2])}\n"
                 f"   📰 News: {r['news']}\n\n"
             )
-        msg += "<b>⚠️ Zerodha mein manually order karo!</b>"
+        msg += "<b>⚠️ Zerodha mein manually order karo!</b>\n"
+        msg += "<i>Har 30 min mein monitor hoga — alert aayega!</i>"
     else:
         msg += "<b>🔴 Aaj koi safe BUY signal nahi.</b>\n"
         if market == "BEARISH":
@@ -200,65 +214,154 @@ def morning_signals():
 
     send_telegram(msg)
 
+# ============================================
+# MONITOR (Har 30 min) — CONSOLIDATED SELL LIST
+# ============================================
 def monitor_trades():
-    now = datetime.now().strftime("%d %b %Y, %I:%M %p")
-    alerts = []
+    now_ist = get_ist_time()
+    now = now_ist.strftime("%d %b %Y, %I:%M %p IST")
+
+    sell_list = []      # NEGATIVE news → SELL
+    caution_list = []   # Price drop > 2% even without bad news
+    safe_list = []      # POSITIVE / NEUTRAL — hold
 
     for name, (ticker, industry) in STOCKS.items():
         try:
-            # Check news for all tracked stocks
-            news_sent, news_titles = check_news(name)
-            df = yf.download(ticker, period="1d", interval="5m", progress=False)
-            if df.empty: continue
-            current = round(float(df['Close'].iloc[-1]), 2)
+            news_sent, news_titles, pos, neg = check_news(name)
+
+            # Get current intraday price
+            df = yf.download(ticker, period="2d", interval="5m", progress=False)
+            if df.empty:
+                continue
+            close = df['Close'].squeeze()
+            current = round(float(close.iloc[-1]), 2)
+
+            # Get yesterday close for % change
+            df_daily = yf.download(ticker, period="2d", interval="1d", progress=False)
+            if not df_daily.empty and len(df_daily) >= 2:
+                yest_close = float(df_daily['Close'].squeeze().iloc[-2])
+                chg_pct = round(((current - yest_close) / yest_close) * 100, 2)
+            else:
+                chg_pct = 0.0
+
+            stock_data = {
+                "name": name,
+                "industry": industry,
+                "price": current,
+                "chg": chg_pct,
+                "news": news_sent,
+                "news_title": news_titles[0] if news_titles else "",
+                "neg_count": neg,
+                "pos_count": pos,
+            }
 
             if news_sent == "NEGATIVE":
-                alerts.append(
-                    f"📰 <b>NEWS ALERT — {name}</b>\n"
-                    f"⚠️ Buri khabar!\n"
-                    f"Current: Rs.{current}\n"
-                    f"News: {news_titles[0] if news_titles else 'Negative news'}\n"
-                    f"<b>Agar kharida hai toh SELL consider karo!</b>"
-                )
+                sell_list.append(stock_data)
+            elif chg_pct < -2.0:
+                # Big drop without explicit bad news — caution
+                caution_list.append(stock_data)
+            else:
+                safe_list.append(stock_data)
+
         except Exception as e:
             print(f"Monitor error {name}: {e}")
 
-    if alerts:
-        for alert in alerts[:3]:  # Max 3 alerts
-            send_telegram(alert)
-    else:
-        print("No alerts — all clear!")
+    # Sort sell list by most negative (highest neg count, then biggest drop)
+    sell_list.sort(key=lambda x: (-x['neg_count'], x['chg']))
+    caution_list.sort(key=lambda x: x['chg'])
 
+    # Build consolidated message
+    msg = f"<b>🔔 30-Min News Alert</b>\n⏰ {now}\n\n"
+
+    if sell_list:
+        msg += f"<b>🔴 SELL KARO ({len(sell_list)} stocks — Negative News):</b>\n\n"
+        for s in sell_list:
+            emoji_chg = "🔻" if s['chg'] < 0 else "▲"
+            msg += (
+                f"<b>{s['name']}</b> [{s['industry']}]\n"
+                f"   💵 Rs.{s['price']} {emoji_chg} {s['chg']:+.2f}%\n"
+                f"   📰 {s['news_title'][:65]}\n"
+                f"   ⚠️ Negative news count: {s['neg_count']}\n\n"
+            )
+    else:
+        msg += "<b>✅ Koi NEGATIVE news wala stock nahi.</b>\n\n"
+
+    if caution_list:
+        msg += f"<b>🟡 CAUTION ({len(caution_list)} stocks — 2%+ drop):</b>\n"
+        for c in caution_list[:5]:
+            msg += f"   • {c['name']}: Rs.{c['price']} ({c['chg']:+.2f}%)\n"
+        msg += "\n"
+
+    msg += f"<b>📊 Summary:</b>\n"
+    msg += f"🔴 Sell signals: {len(sell_list)}\n"
+    msg += f"🟡 Caution: {len(caution_list)}\n"
+    msg += f"🟢 Safe/Hold: {len(safe_list)}\n\n"
+
+    if sell_list:
+        msg += "<b>⚠️ Agar in stocks ko hold kiya hai → Zerodha mein SELL karo!</b>"
+    else:
+        msg += "<i>Sab kuch theek hai — apni positions hold kar sakte ho.</i>"
+
+    send_telegram(msg)
+    print(f"[{now}] Sent monitor alert. Sell={len(sell_list)}, Caution={len(caution_list)}, Safe={len(safe_list)}")
+
+# ============================================
+# CLOSING ALERT (3:15 - 3:30 PM)
+# ============================================
 def closing_alert():
-    now = datetime.now().strftime("%d %b %Y, %I:%M %p")
+    now_ist = get_ist_time()
+    now = now_ist.strftime("%d %b %Y, %I:%M %p IST")
+
+    price_lines = []
+    for name, (ticker, industry) in list(STOCKS.items())[:10]:
+        try:
+            df = yf.download(ticker, period="2d", interval="1d", progress=False)
+            if df.empty: continue
+            close = df['Close'].squeeze()
+            today = round(float(close.iloc[-1]), 2)
+            yesterday = round(float(close.iloc[-2]), 2)
+            chg = round(((today - yesterday) / yesterday) * 100, 2)
+            emoji = "🟢" if chg > 0 else "🔴"
+            price_lines.append(f"{emoji} {name}: Rs.{today} ({chg:+.1f}%)")
+        except:
+            pass
+
     msg = (
-        f"<b>🔔 3:30 PM — Market Band Hone Wala Hai!</b>\n"
-        f"{now}\n\n"
-        f"<b>Abhi apni positions check karo!</b>\n\n"
-        f"✅ Profit mein ho → SELL karo, profit lock karo!\n"
-        f"❌ Loss mein ho → SELL karo, aur loss mat badhao!\n"
-        f"⏳ Breakeven ho → Kal tak hold kar sakte ho\n\n"
-        f"<i>⚠️ 3:30 PM ke baad market band — sab trades close karo!</i>"
+        f"<b>🔔 Market Band Hone Wala Hai!</b>\n"
+        f"⏰ {now}\n\n"
+        f"<b>Aaj ka closing snapshot:</b>\n"
+        + "\n".join(price_lines) +
+        f"\n\n<b>Apni positions check karo:</b>\n"
+        f"✅ Profit mein → SELL karo, profit lock karo!\n"
+        f"❌ Loss mein → SELL karo, aur loss mat badhao!\n"
+        f"⏳ Breakeven → Kal tak hold kar sakte ho\n\n"
+        f"<i>⚠️ 3:30 PM ke baad market band!</i>"
     )
     send_telegram(msg)
 
+# ============================================
+# MAIN
+# ============================================
 if __name__ == "__main__":
-    now = datetime.now()
-    hour = now.hour
-    minute = now.minute
-    print(f"Running at {now.strftime('%H:%M')} IST")
+    now_ist = get_ist_time()
+    hour = now_ist.hour
+    minute = now_ist.minute
+    weekday = now_ist.weekday()
 
-    # 8:30 AM - 9:20 AM = Morning signals
-    if hour == 3 or (hour == 4 and minute < 20):
-        print("Morning signals...")
+    print(f"IST Time: {now_ist.strftime('%A %d %b %Y, %H:%M')}")
+
+    if weekday >= 5:
+        print("Weekend — market band hai. Koi action nahi.")
+        exit(0)
+
+    if hour == 8 or (hour == 9 and minute <= 30):
+        print("Running morning signals...")
         morning_signals()
-    # 9:20 AM - 3:20 PM = Monitor
-    elif (hour == 4 and minute >= 20) or (5 <= hour <= 8) or (hour == 9 and minute <= 20):
-        print("Monitoring trades...")
+    elif (hour == 9 and minute > 30) or (10 <= hour <= 14) or (hour == 15 and minute <= 15):
+        print("Running monitor...")
         monitor_trades()
-    # 3:20 PM - 3:30 PM = Closing alert
-    elif hour == 9 and minute > 20:
-        print("Closing alert...")
+    elif hour == 15 and 15 < minute <= 35:
+        print("Running closing alert...")
         closing_alert()
     else:
-        print("Outside market hours — skipping.")
+        print("Market hours ke bahar — koi action nahi.")
