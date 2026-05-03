@@ -275,43 +275,79 @@ def analyze_stock(name, ticker, industry, market):
         sma50_val = float(sma50.iloc[-1])
         atr = float(atr_series.iloc[-1])
 
-        # Scoring
+        # ============================================
+        # NEWS-FIRST FILTER (CRITICAL)
+        # Pehle news check karo. Agar news kharab hai ya neutral hai
+        # toh technical chahe kitna bhi accha ho — BUY nahi karenge.
+        # ============================================
+        news_sent, news_titles, pos_count, neg_count = check_news(name)
+
+        # Hard filter: Sirf POSITIVE ya MILD_POSITIVE news pe hi BUY
+        if news_sent not in ("POSITIVE", "MILD_POSITIVE"):
+            log.info(f"  ⏭️  {name} skipped — news: {news_sent}")
+            return None
+
+        # Volume check
+        vol_avg = float(df['Volume'].rolling(20).mean().iloc[-1])
+        vol_today = float(df['Volume'].iloc[-1])
+        vol_high = vol_today > vol_avg * 1.2
+
+        # ============================================
+        # TECHNICAL SCORING (only after news passes)
+        # ============================================
         score = 0
         reasons = []
+
+        # News ka strong weight (kyunki ye primary filter hai)
+        if news_sent == "POSITIVE":
+            score += 3
+            reasons.append(f"📰 Strong positive news (pos:{pos_count})")
+        elif news_sent == "MILD_POSITIVE":
+            score += 1.5
+            reasons.append(f"📰 Mild positive news")
+
+        # RSI
         if rsi < 35:
             score += 2
             reasons.append(f"RSI oversold({round(rsi,1)})")
+        elif rsi > 70:
+            # Agar RSI bahut high hai (overbought), buy mat karo even if news positive
+            log.info(f"  ⏭️  {name} skipped — RSI overbought ({round(rsi,1)})")
+            return None
         elif rsi > 65:
-            score -= 2
+            score -= 1
+
+        # MACD
         if macd_val > macd_sig:
             score += 1
             reasons.append("MACD bullish")
         else:
             score -= 1
+
+        # Bollinger Bands
         if price < bb_lo:
             score += 2
             reasons.append("Bollinger low")
         elif price > bb_up:
             score -= 2
+
+        # Trend
         if price > sma20_val > sma50_val:
             score += 1
             reasons.append("Uptrend")
         elif price < sma20_val < sma50_val:
             score -= 1
 
-        # News & volume
-        news_sent, news_titles, _, _ = check_news(name)
-        vol_avg = float(df['Volume'].rolling(20).mean().iloc[-1])
-        vol_today = float(df['Volume'].iloc[-1])
-        vol_high = vol_today > vol_avg * 1.2
+        # Market sentiment
+        if market == "BULLISH":
+            score += 1
+        elif market == "BEARISH":
+            score -= 2
 
-        if market == "BULLISH": score += 1
-        elif market == "BEARISH": score -= 2
-        if news_sent == "POSITIVE": score += 1
-        elif news_sent == "MILD_POSITIVE": score += 0.5
-        elif news_sent == "NEGATIVE": score -= 3
-        elif news_sent == "MILD_NEGATIVE": score -= 1
-        if vol_high: score += 1
+        # Volume confirmation
+        if vol_high:
+            score += 1
+            reasons.append("High volume")
 
         # Target/SL using proper ATR
         target = round(price + (atr * 2), 2)
@@ -359,22 +395,25 @@ def morning_signals():
         for i, r in enumerate(buy_list, 1):
             cost = round(r['price'] * r['shares'], 2)
             profit_est = round((r['target'] - r['price']) * r['shares'], 2)
+            news_emoji = "🟢" if r['news'] == "POSITIVE" else "🟡"
             msg += (
                 f"<b>{i}. {r['name']}</b> [{r['industry']}] — Rs.{r['price']}\n"
+                f"   {news_emoji} <b>News:</b> {r['news']}\n"
+                f"   📰 <i>{r['news_title']}</i>\n"
                 f"   💵 {r['shares']} share = Rs.{cost}\n"
                 f"   🎯 Target: Rs.{r['target']} (+Rs.{profit_est})\n"
                 f"   🛑 SL: Rs.{r['stop_loss']} | R:R={r['rr']}x\n"
-                f"   📊 Score: {r['score']} | {', '.join(r['reasons'][:2])}\n"
-                f"   📰 News: {r['news']}\n\n"
+                f"   📊 Score: {r['score']} | {', '.join(r['reasons'][:2])}\n\n"
             )
         msg += "<b>⚠️ Zerodha mein manually order karo!</b>\n"
-        msg += "<i>Har 30 min mein monitor hoga.</i>"
+        msg += "<i>Har 30 min mein news monitor hoga.</i>"
     else:
-        msg += "<b>🔴 Aaj koi safe BUY signal nahi.</b>\n"
+        msg += "<b>🔴 Aaj koi safe BUY signal nahi.</b>\n\n"
+        msg += "<i>Reason: Kisi bhi stock mein POSITIVE news + accha technical setup nahi mila.</i>\n\n"
         if market == "BEARISH":
-            msg += "Market neeche hai — cash safe rakho! ✅"
+            msg += "Market bhi neeche hai — cash safe rakho! ✅"
         else:
-            msg += "Koi strong setup nahi mila — wait karo."
+            msg += "Wait karo, kal phir check karenge."
 
     send_telegram(msg)
     log.info(f"Morning signals done: {len(buy_list)} buy signals")
