@@ -32,7 +32,13 @@ jobs:
           python-version: '3.11'
 
       - name: Install libraries
-        run: pip install yfinance pandas numpy requests feedparser schedule
+        run: pip install yfinance pandas numpy requests feedparser
 
       - name: Run trading bot
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TEST_MODE: "true"
+          BUDGET: "2000"
+          # PORTFOLIO: "SBIN,IDEA,PNB"   # Uncomment karke specific stocks track karo
         run: python trading_bot.py
