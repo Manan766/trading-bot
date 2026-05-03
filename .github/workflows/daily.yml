@@ -1,0 +1,38 @@
+name: Trading Bot Monitor
+
+on:
+  schedule:
+    - cron: '0 3 * * 1-5'    # 8:30 AM IST  - Pre market
+    - cron: '45 3 * * 1-5'   # 9:15 AM IST  - BUY signals
+    - cron: '15 4 * * 1-5'   # 9:45 AM IST  - Monitor
+    - cron: '45 4 * * 1-5'   # 10:15 AM IST - Monitor
+    - cron: '15 5 * * 1-5'   # 10:45 AM IST - Monitor
+    - cron: '45 5 * * 1-5'   # 11:15 AM IST - Monitor
+    - cron: '15 6 * * 1-5'   # 11:45 AM IST - Monitor
+    - cron: '45 6 * * 1-5'   # 12:15 PM IST - Monitor
+    - cron: '15 7 * * 1-5'   # 12:45 PM IST - Monitor
+    - cron: '45 7 * * 1-5'   # 1:15 PM IST  - Monitor
+    - cron: '15 8 * * 1-5'   # 1:45 PM IST  - Monitor
+    - cron: '45 8 * * 1-5'   # 2:15 PM IST  - Monitor
+    - cron: '15 9 * * 1-5'   # 2:45 PM IST  - Monitor
+    - cron: '45 9 * * 1-5'   # 3:15 PM IST  - Monitor
+    - cron: '0 10 * * 1-5'   # 3:30 PM IST  - Final closing alert
+  workflow_dispatch:
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install libraries
+        run: pip install yfinance pandas numpy requests feedparser
+
+      - name: Run trading bot
+        run: python trading_bot.py
