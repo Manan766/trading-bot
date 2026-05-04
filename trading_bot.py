@@ -1,14 +1,11 @@
 """
-AI Trading Bot — Telegram Alerts
-=================================
-- Morning signals (8:30-9:30 AM IST): BUY recommendations
-- Monitor (9:30 AM - 3:15 PM IST): SELL alerts based on news
-- Closing alert (3:15-3:35 PM IST): Position review
-
-Setup:
-  export TELEGRAM_TOKEN="your_token"
-  export TELEGRAM_CHAT_ID="your_chat_id"
-  export PORTFOLIO="SBIN,IDEA,PNB"   # Optional: track only these
+AI Trading Bot — Telegram Alerts (FIXED)
+=========================================
+Fixes applied:
+1. yfinance MultiIndex columns issue (auto_adjust=True, multi_level_index=False)
+2. TATAMOTORS.NS replaced with TMPV.NS (post Oct-2025 demerger)
+3. Safer float() conversions everywhere using helper
+4. Volume calculation fix
 """
 
 import yfinance as yf
@@ -39,27 +36,21 @@ log = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-# Portfolio: agar specific stocks track karna hai (comma separated)
-# Example: PORTFOLIO="SBIN,IDEA,PNB"
 PORTFOLIO = [s.strip().upper() for s in os.environ.get("PORTFOLIO", "").split(",") if s.strip()]
 
 BUDGET = int(os.environ.get("BUDGET", "2000"))
 MAX_PRICE = int(os.environ.get("MAX_PRICE", "5000"))
 MIN_PRICE = int(os.environ.get("MIN_PRICE", "10"))
 
-# Test mode — relaxed thresholds
 TEST_MODE = os.environ.get("TEST_MODE", "true").lower() == "true"
-SCORE_THRESHOLD = 4 if TEST_MODE else 5  # Strict: even test mein 4 minimum
+SCORE_THRESHOLD = 4 if TEST_MODE else 5
 RR_THRESHOLD = 1.3 if TEST_MODE else 1.5
 
-# IST timezone
 IST = timezone(timedelta(hours=5, minutes=30))
-
-# Telegram message limit
 TG_MAX_LEN = 4000
 
 # ============================================
-# STOCK LIST (29 NSE stocks)
+# STOCK LIST — TATAMOTORS replaced with TMPV (post Oct 2025 demerger)
 # ============================================
 STOCKS = {
     "SBIN":       ("SBIN.NS",       "Banking"),
@@ -68,7 +59,7 @@ STOCKS = {
     "PNB":        ("PNB.NS",        "Banking"),
     "WIPRO":      ("WIPRO.NS",      "IT"),
     "TECHM":      ("TECHM.NS",      "IT"),
-    "TATAMOTORS": ("TATAMOTORS.NS", "Auto"),
+    "TMPV":       ("TMPV.NS",       "Auto"),    # was TATAMOTORS — renamed Oct 2025
     "ASHOKLEY":   ("ASHOKLEY.NS",   "Auto"),
     "SUNPHARMA":  ("SUNPHARMA.NS",  "Pharma"),
     "CIPLA":      ("CIPLA.NS",      "Pharma"),
@@ -94,21 +85,45 @@ STOCKS = {
 }
 
 # ============================================
-# UTILITY FUNCTIONS
+# HELPERS
 # ============================================
 def get_ist_time():
     return datetime.now(IST)
 
 def is_market_open():
-    """NSE market hours: 9:15 AM - 3:30 PM IST, Mon-Fri"""
     now = get_ist_time()
-    if now.weekday() >= 5:  # Sat=5, Sun=6
+    if now.weekday() >= 5:
         return False
     minutes = now.hour * 60 + now.minute
     return 9 * 60 + 15 <= minutes <= 15 * 60 + 30
 
+def safe_float(x):
+    """Convert anything (Series, scalar, numpy) to float safely."""
+    try:
+        if hasattr(x, 'iloc'):
+            x = x.iloc[-1] if len(x) > 0 else float('nan')
+        if hasattr(x, 'item'):
+            return float(x.item())
+        return float(x)
+    except Exception:
+        return float('nan')
+
+def download_history(ticker, period="3mo", interval="1d"):
+    """Wrapper around yf.download that ALWAYS returns flat (non-MultiIndex) columns."""
+    df = yf.download(
+        ticker,
+        period=period,
+        interval=interval,
+        progress=False,
+        auto_adjust=True,
+        multi_level_index=False,  # KEY FIX: prevents MultiIndex columns
+    )
+    # Defensive: flatten MultiIndex if it still exists (older yfinance)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    return df
+
 def validate_config():
-    """Ensure required env vars are set"""
     missing = []
     if not TELEGRAM_TOKEN:
         missing.append("TELEGRAM_TOKEN")
@@ -116,17 +131,12 @@ def validate_config():
         missing.append("TELEGRAM_CHAT_ID")
     if missing:
         log.error(f"Missing environment variables: {', '.join(missing)}")
-        log.error("Set them via: export TELEGRAM_TOKEN='your_token'")
         sys.exit(1)
 
 def send_telegram(message):
-    """Send message to Telegram, auto-split if too long"""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-
-    # Split into chunks if needed
     chunks = []
     while len(message) > TG_MAX_LEN:
-        # Split at last newline before limit
         split_at = message.rfind('\n', 0, TG_MAX_LEN)
         if split_at == -1:
             split_at = TG_MAX_LEN
@@ -162,10 +172,6 @@ NEGATIVE_WORDS = {
 }
 
 def check_news(stock_name):
-    """
-    Returns: (sentiment, titles, pos_count, neg_count)
-    Better thresholds: >=2 difference for clear signal, mild signals also caught
-    """
     try:
         url = f"https://news.google.com/rss/search?q={stock_name}+NSE+India&hl=en-IN&gl=IN&ceid=IN:en"
         feed = feedparser.parse(url)
@@ -178,7 +184,6 @@ def check_news(stock_name):
             pos += len(words & POSITIVE_WORDS)
             neg += len(words & NEGATIVE_WORDS)
 
-        # Improved thresholds
         if neg >= 2 and neg > pos:
             return "NEGATIVE", titles[:2], pos, neg
         elif pos >= 2 and pos > neg:
@@ -215,12 +220,10 @@ def calculate_bollinger(prices, period=20):
     return sma + (2 * std), sma, sma - (2 * std)
 
 def calculate_atr(df, period=14):
-    """Proper ATR using True Range (High-Low, High-PrevClose, Low-PrevClose)"""
-    high = df['High'].squeeze()
-    low = df['Low'].squeeze()
-    close = df['Close'].squeeze()
+    high = df['High']
+    low = df['Low']
+    close = df['Close']
     prev_close = close.shift(1)
-
     tr1 = high - low
     tr2 = (high - prev_close).abs()
     tr3 = (low - prev_close).abs()
@@ -229,11 +232,15 @@ def calculate_atr(df, period=14):
 
 def get_market_sentiment():
     try:
-        nifty = yf.download("^NSEI", period="5d", interval="1d", progress=False)
+        nifty = download_history("^NSEI", period="5d", interval="1d")
         if nifty.empty or len(nifty) < 2:
             return "NEUTRAL", "Market data unavailable"
-        close = nifty['Close'].squeeze()
-        chg = round(((float(close.iloc[-1]) - float(close.iloc[-2])) / float(close.iloc[-2])) * 100, 2)
+        close = nifty['Close']
+        last = safe_float(close.iloc[-1])
+        prev = safe_float(close.iloc[-2])
+        if prev == 0 or np.isnan(prev) or np.isnan(last):
+            return "NEUTRAL", "Market data unavailable"
+        chg = round(((last - prev) / prev) * 100, 2)
         if chg > 0.5:
             return "BULLISH", f"Nifty +{chg}% 📈"
         elif chg < -0.5:
@@ -247,15 +254,15 @@ def get_market_sentiment():
 # MORNING SIGNALS
 # ============================================
 def analyze_stock(name, ticker, industry, market):
-    """Single stock analysis — returns dict if BUY signal, else None"""
     try:
-        df = yf.download(ticker, period="3mo", interval="1d", progress=False)
+        df = download_history(ticker, period="3mo", interval="1d")
         if df.empty or len(df) < 30:
+            log.info(f"  ⏭️  {name} skipped — insufficient data")
             return None
 
-        close = df['Close'].squeeze()
-        price = round(float(close.iloc[-1]), 2)
-        if price > MAX_PRICE or price < MIN_PRICE or price > BUDGET:
+        close = df['Close']
+        price = round(safe_float(close.iloc[-1]), 2)
+        if np.isnan(price) or price > MAX_PRICE or price < MIN_PRICE or price > BUDGET:
             return None
 
         # Indicators
@@ -266,39 +273,35 @@ def analyze_stock(name, ticker, industry, market):
         sma50 = close.rolling(50).mean()
         atr_series = calculate_atr(df)
 
-        rsi = float(rsi_series.iloc[-1])
-        macd_val = float(macd_series.iloc[-1])
-        macd_sig = float(signal_series.iloc[-1])
-        bb_lo = float(bb_lower.iloc[-1])
-        bb_up = float(bb_upper.iloc[-1])
-        sma20_val = float(sma20.iloc[-1])
-        sma50_val = float(sma50.iloc[-1])
-        atr = float(atr_series.iloc[-1])
+        rsi = safe_float(rsi_series.iloc[-1])
+        macd_val = safe_float(macd_series.iloc[-1])
+        macd_sig = safe_float(signal_series.iloc[-1])
+        bb_lo = safe_float(bb_lower.iloc[-1])
+        bb_up = safe_float(bb_upper.iloc[-1])
+        sma20_val = safe_float(sma20.iloc[-1])
+        sma50_val = safe_float(sma50.iloc[-1])
+        atr = safe_float(atr_series.iloc[-1])
 
-        # ============================================
-        # NEWS-FIRST FILTER (CRITICAL)
-        # Pehle news check karo. Agar news kharab hai ya neutral hai
-        # toh technical chahe kitna bhi accha ho — BUY nahi karenge.
-        # ============================================
+        if any(np.isnan(v) for v in [rsi, macd_val, macd_sig, bb_lo, bb_up, sma20_val, sma50_val, atr]):
+            log.info(f"  ⏭️  {name} skipped — NaN in indicators")
+            return None
+
+        # NEWS-FIRST FILTER
         news_sent, news_titles, pos_count, neg_count = check_news(name)
-
-        # Hard filter: Sirf POSITIVE ya MILD_POSITIVE news pe hi BUY
         if news_sent not in ("POSITIVE", "MILD_POSITIVE"):
             log.info(f"  ⏭️  {name} skipped — news: {news_sent}")
             return None
 
-        # Volume check
-        vol_avg = float(df['Volume'].rolling(20).mean().iloc[-1])
-        vol_today = float(df['Volume'].iloc[-1])
-        vol_high = vol_today > vol_avg * 1.2
+        # Volume
+        volume = df['Volume']
+        vol_avg = safe_float(volume.rolling(20).mean().iloc[-1])
+        vol_today = safe_float(volume.iloc[-1])
+        vol_high = (not np.isnan(vol_avg)) and (not np.isnan(vol_today)) and vol_today > vol_avg * 1.2
 
-        # ============================================
-        # TECHNICAL SCORING (only after news passes)
-        # ============================================
+        # SCORING
         score = 0
         reasons = []
 
-        # News ka strong weight (kyunki ye primary filter hai)
         if news_sent == "POSITIVE":
             score += 3
             reasons.append(f"📰 Strong positive news (pos:{pos_count})")
@@ -306,50 +309,42 @@ def analyze_stock(name, ticker, industry, market):
             score += 1.5
             reasons.append(f"📰 Mild positive news")
 
-        # RSI
         if rsi < 35:
             score += 2
             reasons.append(f"RSI oversold({round(rsi,1)})")
         elif rsi > 70:
-            # Agar RSI bahut high hai (overbought), buy mat karo even if news positive
             log.info(f"  ⏭️  {name} skipped — RSI overbought ({round(rsi,1)})")
             return None
         elif rsi > 65:
             score -= 1
 
-        # MACD
         if macd_val > macd_sig:
             score += 1
             reasons.append("MACD bullish")
         else:
             score -= 1
 
-        # Bollinger Bands
         if price < bb_lo:
             score += 2
             reasons.append("Bollinger low")
         elif price > bb_up:
             score -= 2
 
-        # Trend
         if price > sma20_val > sma50_val:
             score += 1
             reasons.append("Uptrend")
         elif price < sma20_val < sma50_val:
             score -= 1
 
-        # Market sentiment
         if market == "BULLISH":
             score += 1
         elif market == "BEARISH":
             score -= 2
 
-        # Volume confirmation
         if vol_high:
             score += 1
             reasons.append("High volume")
 
-        # Target/SL using proper ATR
         target = round(price + (atr * 2), 2)
         sl = round(price - (atr * 1.5), 2)
         rr = round((target - price) / (price - sl), 2) if (price - sl) > 0 else 0
@@ -383,7 +378,6 @@ def morning_signals():
         if result:
             buy_list.append(result)
 
-    # Sort by price ascending (sasta pehle)
     buy_list.sort(key=lambda x: x['price'])
 
     mode_tag = " 🧪 [TEST]" if TEST_MODE else ""
@@ -419,17 +413,18 @@ def morning_signals():
     log.info(f"Morning signals done: {len(buy_list)} buy signals")
 
 # ============================================
-# MONITOR (30-min sell alerts)
+# MONITOR
 # ============================================
 def get_stock_snapshot(ticker):
-    """Single API call to get current price + yesterday close"""
     try:
-        df = yf.download(ticker, period="5d", interval="1d", progress=False)
+        df = download_history(ticker, period="5d", interval="1d")
         if df.empty or len(df) < 2:
             return None, None
-        close = df['Close'].squeeze()
-        current = round(float(close.iloc[-1]), 2)
-        yesterday = float(close.iloc[-2])
+        close = df['Close']
+        current = round(safe_float(close.iloc[-1]), 2)
+        yesterday = safe_float(close.iloc[-2])
+        if np.isnan(current) or np.isnan(yesterday) or yesterday == 0:
+            return None, None
         chg_pct = round(((current - yesterday) / yesterday) * 100, 2)
         return current, chg_pct
     except Exception as e:
@@ -437,12 +432,10 @@ def get_stock_snapshot(ticker):
         return None, None
 
 def monitor_trades():
-    """Check news + price for all stocks, send consolidated alert"""
     log.info("🔍 Running monitor...")
     now_ist = get_ist_time()
     now = now_ist.strftime("%d %b %Y, %I:%M %p IST")
 
-    # If portfolio is set, only monitor those stocks (faster)
     target_stocks = STOCKS
     if PORTFOLIO:
         target_stocks = {k: v for k, v in STOCKS.items() if k in PORTFOLIO}
@@ -470,10 +463,8 @@ def monitor_trades():
             if news_sent == "NEGATIVE":
                 sell_list.append(stock_data)
             elif news_sent == "MILD_NEGATIVE" and (chg_pct or 0) < -1.5:
-                # Mild bad news + price drop = caution
                 caution_list.append(stock_data)
             elif (chg_pct or 0) < -2.5:
-                # Big drop without bad news
                 caution_list.append(stock_data)
             else:
                 safe_count += 1
@@ -524,7 +515,6 @@ def closing_alert():
     now_ist = get_ist_time()
     now = now_ist.strftime("%d %b %Y, %I:%M %p IST")
 
-    # Show portfolio if set, else all stocks
     target_stocks = STOCKS
     if PORTFOLIO:
         target_stocks = {k: v for k, v in STOCKS.items() if k in PORTFOLIO}
@@ -535,7 +525,6 @@ def closing_alert():
         if current is not None:
             snapshots.append((name, current, chg or 0.0))
 
-    # Sort by % change descending (gainers first)
     snapshots.sort(key=lambda x: -x[2])
 
     price_lines = []
@@ -569,7 +558,6 @@ def main():
     if PORTFOLIO:
         log.info(f"Portfolio filter: {PORTFOLIO}")
 
-    # Weekend check
     if now_ist.weekday() >= 5:
         log.info("Weekend — market band hai. Exit.")
         return
@@ -577,7 +565,6 @@ def main():
     hour = now_ist.hour
     minute = now_ist.minute
 
-    # Allow manual override via CLI arg for testing
     if len(sys.argv) > 1:
         cmd = sys.argv[1].lower()
         if cmd == "morning":
@@ -594,13 +581,10 @@ def main():
         return
 
     # Auto-schedule based on time
-    # Morning: 8:30-9:30 AM
     if (hour == 8 and minute >= 30) or (hour == 9 and minute <= 30):
         morning_signals()
-    # Monitor: 9:30 AM - 3:15 PM
     elif (hour == 9 and minute > 30) or (10 <= hour <= 14) or (hour == 15 and minute <= 15):
         monitor_trades()
-    # Closing: 3:15 PM - 3:35 PM
     elif hour == 15 and 15 < minute <= 35:
         closing_alert()
     else:
