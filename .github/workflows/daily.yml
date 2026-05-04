@@ -1,23 +1,21 @@
 name: Trading Bot Monitor
 
+# Schedule removed - cron-job.org will trigger this via API
+# This is more reliable than GitHub's built-in schedule (which has 30+ min delays)
 on:
-  schedule:
-    - cron: '0 3 * * 1-5'    # 8:30 AM IST  - Pre market
-    - cron: '45 3 * * 1-5'   # 9:15 AM IST  - BUY signals
-    - cron: '15 4 * * 1-5'   # 9:45 AM IST  - Monitor
-    - cron: '45 4 * * 1-5'   # 10:15 AM IST - Monitor
-    - cron: '15 5 * * 1-5'   # 10:45 AM IST - Monitor
-    - cron: '45 5 * * 1-5'   # 11:15 AM IST - Monitor
-    - cron: '15 6 * * 1-5'   # 11:45 AM IST - Monitor
-    - cron: '45 6 * * 1-5'   # 12:15 PM IST - Monitor
-    - cron: '15 7 * * 1-5'   # 12:45 PM IST - Monitor
-    - cron: '45 7 * * 1-5'   # 1:15 PM IST  - Monitor
-    - cron: '15 8 * * 1-5'   # 1:45 PM IST  - Monitor
-    - cron: '45 8 * * 1-5'   # 2:15 PM IST  - Monitor
-    - cron: '15 9 * * 1-5'   # 2:45 PM IST  - Monitor
-    - cron: '45 9 * * 1-5'   # 3:15 PM IST  - Monitor
-    - cron: '0 10 * * 1-5'   # 3:30 PM IST  - Final closing alert
   workflow_dispatch:
+    inputs:
+      task:
+        description: 'Which task to run'
+        required: false
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - morning
+          - monitor
+          - closing
+          - test
 
 jobs:
   run-bot:
@@ -40,5 +38,10 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TEST_MODE: "true"
           BUDGET: "2000"
-          # PORTFOLIO: "SBIN,IDEA,PNB"   # Uncomment karke specific stocks track karo
-        run: python trading_bot.py
+          # PORTFOLIO: "SBIN,IDEA,PNB"
+        run: |
+          if [ "${{ github.event.inputs.task }}" = "auto" ] || [ -z "${{ github.event.inputs.task }}" ]; then
+            python trading_bot.py
+          else
+            python trading_bot.py ${{ github.event.inputs.task }}
+          fi
